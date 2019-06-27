@@ -1540,10 +1540,34 @@ func (c *Client) GetSignupTokenData(token string) (user string, otpQRCode []byte
 	return tokenData.User, tokenData.QRImg, nil
 }
 
+// GenerateUserCertSet takes the public key in the OpenSSH `authorized_keys` plain
+// text format, signs it using User Certificate Authority signing key and
+// returns the resulting certificates.
+func (c *Client) GenerateUserCertSet(key []byte, user string, ttl time.Duration, compatibility string) (*proto.CertSet, error) {
+	clt, err := c.grpc()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	certs, err := clt.GenerateUserCertSet(context.TODO(), &proto.UserCertsRequest{
+		Key:           key,
+		Username:      user,
+		Ttl:           ttl,
+		Compatibility: compatibility,
+	})
+	if err != nil {
+		return nil, trail.FromGRPC(err)
+	}
+	return certs, nil
+}
+
 // GenerateUserCert takes the public key in the OpenSSH `authorized_keys` plain
 // text format, signs it using User Certificate Authority signing key and
 // returns the resulting certificate.
 func (c *Client) GenerateUserCert(key []byte, user string, ttl time.Duration, compatibility string) ([]byte, error) {
+	/// Attempt to acquire cert via GRPC first.  If this fails, fallback to the old http based api.
+	if certs, err := c.GenerateUserCertSet(key, user, ttl, compatibility); err == nil {
+		return certs.Ssh, nil
+	}
 	out, err := c.PostJSON(c.Endpoint("ca", "user", "certs"),
 		generateUserCertReq{
 			Key:           key,
@@ -2602,6 +2626,11 @@ type IdentityService interface {
 	// plain text format, signs it using Host Certificate Authority private key and returns the
 	// resulting certificate.
 	GenerateHostCert(key []byte, hostID, nodeName string, principals []string, clusterName string, roles teleport.Roles, ttl time.Duration) ([]byte, error)
+
+	// GenerateUserCertSet takes the public key in the OpenSSH `authorized_keys` plain
+	// text format, signs it using User Certificate Authority signing key and
+	// returns the resulting certificates.
+	GenerateUserCertSet(key []byte, user string, ttl time.Duration, compatibility string) (*proto.CertSet, error)
 
 	// GenerateUserCert takes the public key in the OpenSSH `authorized_keys`
 	// plain text format, signs it using User Certificate Authority signing key and returns the
