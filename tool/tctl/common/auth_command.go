@@ -333,9 +333,18 @@ func (a *AuthCommand) generateUserKeys(clusterApi auth.ClientI) error {
 		return trace.Wrap(err)
 	}
 
-	// sign it and produce a cert:
-	key.Cert, err = clusterApi.GenerateUserCert(key.Pub, a.genUser, a.genTTL, certificateFormat)
-	if err != nil {
+	// Request signed certs from `auth` server.
+	certs, err := clusterApi.GenerateUserCertSet(key.Pub, a.genUser, a.genTTL, certificateFormat)
+	switch {
+	case err == nil:
+		key.Cert = certs.Ssh
+		key.TLSCert = certs.Tls
+	case trace.IsNotImplemented(err):
+		key.Cert, err = clusterApi.GenerateUserCert(key.Pub, a.genUser, a.genTTL, certificateFormat)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	default:
 		return trace.Wrap(err)
 	}
 

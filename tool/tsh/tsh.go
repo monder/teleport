@@ -20,6 +20,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -37,6 +39,7 @@ import (
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/asciitable"
+	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	kubeclient "github.com/gravitational/teleport/lib/kube/client"
@@ -869,6 +872,12 @@ func makeClient(cf *CLIConf, useProfileLogin bool) (tc *client.TeleportClient, e
 		}
 		c.AuthMethods = []ssh.AuthMethod{identityAuth}
 
+		if len(key.TLSCert) > 0 {
+			c.TLS, err = key.ClientTLSConfig()
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+		}
 		// check the expiration date
 		expiryDate, _ = key.CertValidBefore()
 		if expiryDate.Before(time.Now()) {
@@ -1005,16 +1014,19 @@ func loadIdentity(idFn string) (*client.Key, ssh.HostKeyCallback, error) {
 	}
 	defer f.Close()
 	var (
-		keyBuf  bytes.Buffer
-		state   int // 0: not found, 1: found beginning, 2: found ending
-		cert    []byte
-		caCerts [][]byte
+		keyBuf     bytes.Buffer
+		state      int // 0: init, 1: reading key, 2: not reading, 3: reading tls cert
+		cert       []byte
+		tlsCertBuf bytes.Buffer
+		tlsCert    []byte
+		tlsCACerts [][]byte
+		caCerts    [][]byte
 	)
 	// read the identity file line by line:
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if state != 1 {
+		if state%2 != 1 { // Odd numbered state means that we are in the middle of a read
 			if strings.HasPrefix(line, "ssh") {
 				cert = []byte(line)
 				continue
@@ -1038,6 +1050,28 @@ func loadIdentity(idFn string) (*client.Key, ssh.HostKeyCallback, error) {
 				keyBuf.WriteRune('\n')
 			}
 		}
+		if state == 2 && strings.HasPrefix(line, "-----BEGIN") {
+			state = 3
+			tlsCertBuf.WriteString(line)
+			tlsCertBuf.WriteRune('\n')
+			continue
+		}
+		if state == 3 {
+			tlsCertBuf.WriteString(line)
+			if strings.HasPrefix(line, "-----END") {
+				fullCert := make([]byte, tlsCertBuf.Len())
+				copy(fullCert, tlsCertBuf.Bytes())
+				tlsCertBuf.Reset()
+				if len(tlsCert) == 0 {
+					tlsCert = fullCert
+				} else {
+					tlsCACerts = append(tlsCACerts, fullCert)
+				}
+				state = 2
+			} else {
+				tlsCertBuf.WriteRune('\n')
+			}
+		}
 	}
 	// did not find the certificate in the file? look in a separate file with
 	// -cert.pub prefix
@@ -1057,6 +1091,26 @@ func loadIdentity(idFn string) (*client.Key, ssh.HostKeyCallback, error) {
 	signer, err := ssh.NewSignerFromKey(privKey)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
+	}
+	// validate TLS Cert (if present):
+	if len(tlsCert) > 0 {
+		_, err := tls.X509KeyPair(tlsCert, keyBuf.Bytes())
+		if err != nil {
+			return nil, nil, trace.Wrap(err)
+		}
+	}
+	/// Validate TLS CA certs (if present).
+	var trustedCA []auth.TrustedCerts
+	if len(tlsCACerts) > 0 {
+		var trustedCerts auth.TrustedCerts
+		pool := x509.NewCertPool()
+		for _, certPEM := range tlsCACerts {
+			if !pool.AppendCertsFromPEM(certPEM) {
+				return nil, nil, trace.BadParameter("failed to parse tls CA cert from identity file")
+			}
+			trustedCerts.TLSCertificates = append(trustedCerts.TLSCertificates, certPEM)
+		}
+		trustedCA = []auth.TrustedCerts{trustedCerts}
 	}
 	var hostAuthFunc ssh.HostKeyCallback = nil
 	// validate CA (cluster) cert
@@ -1089,9 +1143,11 @@ func loadIdentity(idFn string) (*client.Key, ssh.HostKeyCallback, error) {
 		}
 	}
 	return &client.Key{
-		Priv: keyBuf.Bytes(),
-		Pub:  signer.PublicKey().Marshal(),
-		Cert: cert,
+		Priv:      keyBuf.Bytes(),
+		Pub:       signer.PublicKey().Marshal(),
+		Cert:      cert,
+		TLSCert:   tlsCert,
+		TrustedCA: trustedCA,
 	}, hostAuthFunc, nil
 }
 
